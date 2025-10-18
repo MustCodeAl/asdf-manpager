@@ -1,187 +1,71 @@
 #!/usr/bin/env bash
-# asdf/mise plugin install helper
-# Usage:
-#   bin/install <version> <install_path>
-#   bin/install "" <install_path>   # use default version
-# If install_path is not supplied, this script will try common env vars
-# and finally fall back to ~/.asdf/installs/manpager/<version>
+# asdf plugin install helper (ASDF env var style, function-oriented, robust temp handling)
+# Called by asdf/mise as: bin/install
+# Uses ASDF_INSTALL_VERSION and ASDF_INSTALL_PATH (optional ASDF_DOWNLOAD_PATH)
 set -euo pipefail
 
-# ---- Configuration ----
-DEFAULT_VERSION="0.0.3"
-PLUGIN_NAME="manpager"
+ASDF_INSTALL_TYPE=${ASDF_INSTALL_TYPE:-version}
+TMPDIR=${TMPDIR:-/tmp}
+
 GH_REPO="Freed-Wu/manpager"
-GITHUB_ARCHIVE_TEMPLATE="https://github.com/${GH_REPO}/archive/refs/tags/%s.tar.gz"
 
-# ---- helpers ----
-# shellcheck source=../lib/utils.bash
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/utils.bash"
-
-get_version_from_args_or_env() {
-  local arg="${1:-}"
-  local v=""
-
-  if [ -n "${arg}" ]; then
-    v="${arg}"
+# Helpers
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+info() {
+  echo "INFO: $*"
+}
+warn() {
+  echo "WARN: $*" >&2
+}
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    fail "Command '$1' not found. Please install it and retry."
   fi
-
-  # Common fallback environment variables
-  if [ -z "${v}" ]; then
-    v="${MISE_VERSION:-${Mise_VERSION:-${MISE_ARG_VERSION:-${ASDF_INSTALL_VERSION:-${ASDF_VERSION:-}}}}}"
-  fi
-
-  if [ -z "${v}" ] && [ -n "${MISE_ARG:-}" ]; then
-    case "${MISE_ARG}" in
-      *@*) v="${MISE_ARG#*@}" ;;
-    esac
-  fi
-
-  if [ -z "${v}" ] && [ -n "${arg}" ]; then
-    case "${arg}" in
-      *@*) v="${arg#*@}" ;;
-    esac
-  fi
-
-  if [ -z "${v}" ]; then
-    v="${DEFAULT_VERSION}"
-    info "no version supplied; defaulting to ${v}"
-  fi
-
-  printf '%s' "${v}"
 }
 
-determine_install_dir() {
-  local provided="${1:-}"
-  local version="${2:-}"
-  local dir=""
-
-  # 1) explicit positional provided by caller
-  if [ -n "${provided}" ]; then
-    dir="${provided}"
+# Determine latest tag if ASDF_INSTALL_VERSION is not provided
+get_latest_release_version() {
+  info "Fetching latest release for ${GH_REPO}"
+  # Try releases/latest
+  tag="$(curl -fsSL "https://api.github.com/repos/${GH_REPO}/releases/latest" 2>/dev/null | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' || true)"
+  if [ -n "${tag:-}" ]; then
+    echo "${tag}"
+    return 0
   fi
 
-  # 2) common environment variables used by asdf/mise
-  if [ -z "${dir}" ]; then
-    dir="${ASDF_INSTALL_DIR:-${ASDF_INSTALL_PATH:-${MISE_INSTALL_DIR:-${MISE_PREFIX:-}}}}"
+  # Fallback to tags list
+  tag="$(curl -fsSL "https://api.github.com/repos/${GH_REPO}/tags?per_page=1" 2>/dev/null | sed -n 's/.*"name":[[:space:]]*"\([^"]*\)".*/\1/p' || true)"
+  if [ -n "${tag:-}" ]; then
+    echo "${tag}"
+    return 0
   fi
 
-  # 3) ASDF_DIR or ASDF_DATA_DIR layout if available
-  if [ -z "${dir}" ]; then
-    if [ -n "${ASDF_DATA_DIR:-}" ]; then
-      dir="${ASDF_DATA_DIR}/installs/${PLUGIN_NAME}/${version}"
-    elif [ -n "${ASDF_DIR:-}" ]; then
-      dir="${ASDF_DIR}/installs/${PLUGIN_NAME}/${version}"
-    fi
-  fi
-
-  # 4) MISE common fallback layout
-  if [ -z "${dir}" ] && [ -n "${HOME:-}" ]; then
-    # prefer mise location if MISE_HOME is present
-    if [ -n "${MISE_HOME:-}" ]; then
-      dir="${MISE_HOME}/installs/${PLUGIN_NAME}/${version}"
-    else
-      # final fallback to asdf-like path in home
-      dir="${HOME}/.asdf/installs/${PLUGIN_NAME}/${version}"
-    fi
-  fi
-
-  printf '%s' "${dir}"
+  warn "Unable to determine latest tag from GitHub API; defaulting to 'latest'"
+  echo "latest"
 }
 
-validate_upstream_tag() {
+get_archive_url() {
   local version="$1"
-  local url
-  url="$(printf "${GITHUB_ARCHIVE_TEMPLATE}" "${version}")"
-  info "Checking upstream archive: ${url}"
-  if command -v curl >/dev/null 2>&1; then
-    if ! curl -fSL --head "${url}" >/dev/null 2>&1; then
-      return 1
-    fi
-  elif command -v wget >/dev/null 2>&1; then
-    if ! wget --spider -q "${url}" >/dev/null 2>&1; then
-      return 1
-    fi
-  else
-    fail "Neither curl nor wget is available to check upstream."
-  fi
-  return 0
+  echo "https://github.com/${GH_REPO}/archive/refs/tags/${version}.tar.gz"
 }
 
-download_archive() {
-  local version="$1"
-  local dest="$2"
-  local url
-  url="$(printf "${GITHUB_ARCHIVE_TEMPLATE}" "${version}")"
-  info "Downloading ${url} -> ${dest}"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "${url}" -o "${dest}" || return 1
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO "${dest}" "${url}" || return 1
-  else
-    fail "Neither curl nor wget found to download archive"
-  fi
-}
-
-extract_archive_to_tmp() {
-  local archive="$1"
-  local destdir="$2"
-  mkdir -p "${destdir}"
-  tar -xzf "${archive}" -C "${destdir}" || return 1
-}
-
-find_extracted_root() {
+find_src_root() {
   local srcdir="$1"
-  local root
-  root="$(find "${srcdir}" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
-  printf '%s' "${root}"
-}
-
-normalize_install_tree() {
-  local src_root="$1"
-  local install_dir="$2"
-
-  info "Copying source files to ${install_dir}"
-  mkdir -p "${install_dir}"
-  cp -R "${src_root}/." "${install_dir}/"
-
-  mkdir -p "${install_dir}/bin"
-
-  local candidate=""
-  if [ -f "${install_dir}/manpager" ]; then
-    candidate="${install_dir}/manpager"
-  elif [ -f "${install_dir}/bin/manpager" ]; then
-    candidate="${install_dir}/bin/manpager"
-  else
-    candidate="$(find "${install_dir}" -maxdepth 3 -type f -name 'manpager' -perm /u+x 2>/dev/null | head -n1 || true)"
-  fi
-
-  if [ -z "${candidate}" ]; then
-    candidate="$(find "${install_dir}" -maxdepth 3 -type f -name 'manpager' 2>/dev/null | head -n1 || true)"
-  fi
-
-  if [ -z "${candidate}" ] && [ -f "${install_dir}/manpager.sh" ]; then
-    candidate="${install_dir}/manpager.sh"
-  fi
-
-  if [ -n "${candidate}" ]; then
-    info "Using candidate executable: ${candidate}"
-    chmod +x "${candidate}" || true
-    if [ "${candidate}" != "${install_dir}/bin/manpager" ]; then
-      cp -f "${candidate}" "${install_dir}/bin/manpager"
-    fi
-  else
-    info "No manpager file found; creating shim"
-    create_shim "${install_dir}"
-  fi
+  find "${srcdir}" -mindepth 1 -maxdepth 1 -type d | head -n1 || true
 }
 
 create_shim() {
   local install_dir="$1"
+  mkdir -p "${install_dir}/bin"
   cat > "${install_dir}/bin/manpager" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root_dir="$(cd "${self_dir}/.." && pwd)"
+# Prefer root-level executable
 if [ -x "${root_dir}/manpager" ]; then
   exec "${root_dir}/manpager" "$@"
 elif [ -x "${root_dir}/bin/manpager" ] && [ "${root_dir}/bin/manpager" != "${self_dir}/manpager" ]; then
@@ -194,61 +78,116 @@ EOF
   chmod +x "${install_dir}/bin/manpager"
 }
 
-write_version_file() {
-  local version="$1"
-  local install_dir="$2"
-  echo "${version}" > "${install_dir}/VERSION"
+detect_and_install_executable() {
+  local install_dir="$1"
+  local candidate=""
+
+  mkdir -p "${install_dir}/bin"
+
+  if [ -f "${install_dir}/manpager" ]; then
+    candidate="${install_dir}/manpager"
+  elif [ -f "${install_dir}/bin/manpager" ]; then
+    candidate="${install_dir}/bin/manpager"
+  else
+    candidate="$(find "${install_dir}" -maxdepth 2 -type f -name 'manpager' | head -n1 || true)"
+  fi
+
+  if [ -z "${candidate}" ] && [ -f "${install_dir}/manpager.sh" ]; then
+    candidate="${install_dir}/manpager.sh"
+  fi
+
+  if [ -n "${candidate}" ]; then
+    chmod +x "${candidate}" || true
+    if [ "${candidate}" != "${install_dir}/bin/manpager" ]; then
+      cp -f "${candidate}" "${install_dir}/bin/manpager"
+    fi
+  else
+    create_shim "${install_dir}"
+  fi
 }
 
-# ---- entrypoint ----
-main() {
-  local raw_arg_version="${1:-}"
-  local raw_arg_install="${2:-}"
+install_manpager() {
+  local install_type="$1"
+  local version="$2"
+  local install_path="$3"
 
-  local version
-  version="$(get_version_from_args_or_env "${raw_arg_version}")"
+  require_cmd curl
+  require_cmd tar
+  require_cmd mkdir
+  require_cmd cp
+  require_cmd find
 
-  local install_dir
-  install_dir="$(determine_install_dir "${raw_arg_install}" "${version}")"
+  # Safe tmp dir variable (avoid 'unbound variable' in traps)
+  tmp_download_dir=""
 
-  if [ -z "${install_dir}" ]; then
-    fail "install path is required and could not be determined from arguments or environment"
+  cleanup() {
+    # Use parameter expansion to avoid unbound var errors under 'set -u'
+    if [ -n "${tmp_download_dir:-}" ] && [ -d "${tmp_download_dir:-}" ]; then
+      rm -rf "${tmp_download_dir}"
+    fi
+  }
+  trap cleanup EXIT
+
+  # Decide where to download/extract
+  if [ -n "${ASDF_DOWNLOAD_PATH:-}" ]; then
+    mkdir -p "${ASDF_DOWNLOAD_PATH}"
+    tmp_download_dir="${ASDF_DOWNLOAD_PATH}"
+  elif [ -z "${TMPDIR:-}" ]; then
+    tmp_download_dir="$(mktemp -d -t manpager_XXXXXX)"
+  else
+    # If TMPDIR is a path to a directory, use it; otherwise create a temp dir inside it
+    if [ -d "${TMPDIR}" ]; then
+      tmp_download_dir="$(mktemp -d -p "${TMPDIR}" manpager_XXXXXX)"
+    else
+      tmp_download_dir="$(mktemp -d -t manpager_XXXXXX)"
+    fi
   fi
 
-  info "Installing ${PLUGIN_NAME} version ${version} to ${install_dir}"
+  mkdir -p "${install_path}"
+  mkdir -p "${install_path}/bin"
 
-  if ! validate_upstream_tag "${version}"; then
-    info "Upstream tag ${version} not found. Available tags (via list-all):"
-    "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/list-all" >&2 || true
-    fail "Upstream tag ${version} not found or unreachable."
-  fi
+  local download_url
+  download_url="$(get_archive_url "${version}")"
 
-  ensure_cmd mkdir
-  ensure_cmd cp
-  ensure_cmd tar
-  ensure_cmd find
+  info "Downloading ${GH_REPO}@${version} from ${download_url}"
+  local archive_path="${tmp_download_dir}/src.tar.gz"
+  curl -fsSL "${download_url}" -o "${archive_path}" || fail "Failed to download ${download_url}"
 
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "${tmpdir}"' EXIT
-
-  local archive="${tmpdir}/src.tar.gz"
-  if ! download_archive "${version}" "${archive}"; then
-    fail "Failed to download archive for ${version}"
-  fi
-
-  local extracted_dir="${tmpdir}/src"
-  extract_archive_to_tmp "${archive}" "${extracted_dir}"
+  info "Extracting archive"
+  local src_extract="${tmp_download_dir}/src"
+  mkdir -p "${src_extract}"
+  tar -xzf "${archive_path}" -C "${src_extract}" || fail "Failed to extract archive"
 
   local src_root
-  src_root="$(find_extracted_root "${extracted_dir}")"
-  [ -d "${src_root}" ] || fail "Failed to locate extracted source root."
+  src_root="$(find_src_root "${src_extract}")"
+  [ -d "${src_root}" ] || fail "Failed to locate source root directory."
 
-  normalize_install_tree "${src_root}" "${install_dir}"
-  write_version_file "${version}" "${install_dir}"
+  info "Copying source files to ${install_path}"
+  cp -R "${src_root}/." "${install_path}/"
 
-  info "Installed ${PLUGIN_NAME} ${version} to ${install_dir}"
-  info "Hint: run 'asdf reshim ${PLUGIN_NAME}' if using asdf; mise typically handles shims automatically."
+  detect_and_install_executable "${install_path}"
+
+  echo "${version}" > "${install_path}/VERSION"
+
+  info "Installed manpager ${version} to ${install_path}"
+  info "Hint: run 'asdf reshim manpager' if using asdf; mise typically handles shims automatically"
 }
 
-main "$@"
+# Entrypoint behavior (ASDF style)
+# If ASDF_INSTALL_VERSION not provided, attempt to fetch latest. If still empty, error.
+if [ -z "${ASDF_INSTALL_VERSION:-}" ]; then
+  ASDF_INSTALL_VERSION="$(get_latest_release_version)"
+fi
+
+if [ -z "${ASDF_INSTALL_VERSION:-}" ]; then
+  fail "Missing ASDF_INSTALL_VERSION"
+fi
+
+if [ -z "${ASDF_INSTALL_PATH:-}" ]; then
+  fail "Missing ASDF_INSTALL_PATH"
+fi
+
+# Only run installer when script executed directly
+if [[ "${BASH_SOURCE[0]}" = "$0" ]]; then
+  install_manpager "${ASDF_INSTALL_TYPE}" "${ASDF_INSTALL_VERSION}" "${ASDF_INSTALL_PATH}"
+fi
