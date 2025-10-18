@@ -1,0 +1,3 @@
+shellcheck 0.10.0
+shfmt 3.9.0
+bats 1.11.0

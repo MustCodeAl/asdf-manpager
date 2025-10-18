@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint-and-test:
+    name: Lint and Test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Shellcheck
+        uses: ludeeus/action-shellcheck@v2
+        with:
+          scandir: .
+
+      - name: Install shfmt
+        uses: shenxianpeng/setup-shfmt@v4
+        with:
+          shfmt-version: v3.9.0
+
+      - name: Run shfmt
+        run: |
+          shfmt -d -i 2 -ci -sr .
+
+      - name: Setup Bats
+        uses: bats-core/bats-action@2.0.0
+        with:
+          bats-version: 1.11.0
+
+      - name: Run tests
+        run: bats -r test

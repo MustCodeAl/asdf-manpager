@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# List remote tags from Freed-Wu/manpager as available versions
+# Usage: bin/list-all
+set -euo pipefail
+
+GH_REPO="Freed-Wu/manpager"
+
+if ! command -v git >/dev/null 2>&1; then
+  echo "git is required" >&2
+  exit 1
+fi
+
+git ls-remote --tags --refs "https://github.com/${GH_REPO}.git" 2>/dev/null \
+  | awk '{print $2}' \
+  | sed -E 's#refs/tags/##' \
+  | sed -E 's#\^\{\}$##' \
+  | sort -V

@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# asdf plugin install helper
+# Called as: bin/install <version> <install_path>
+set -euo pipefail
+
+VERSION="${1:?version is required}"
+INSTALL_DIR="${2:?install dir is required}"
+
+# shellcheck source=../lib/utils.bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/utils.bash"
+
+GH_REPO="Freed-Wu/manpager"
+ARCHIVE_URL="https://github.com/${GH_REPO}/archive/refs/tags/${VERSION}.tar.gz"
+
+ensure_cmd curl
+ensure_cmd tar
+ensure_cmd mkdir
+ensure_cmd cp
+
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "${tmpdir}"' EXIT
+
+info "Downloading ${GH_REPO}@${VERSION}"
+curl -fsSL "${ARCHIVE_URL}" -o "${tmpdir}/src.tar.gz"
+
+info "Extracting archive"
+mkdir -p "${tmpdir}/src"
+tar -xzf "${tmpdir}/src.tar.gz" -C "${tmpdir}/src"
+
+src_root="$(find "${tmpdir}/src" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
+[ -d "${src_root}" ] || fail "Failed to locate source root directory."
+
+# Prepare install dir
+mkdir -p "${INSTALL_DIR}"
+cp -R "${src_root}/." "${INSTALL_DIR}/"
+
+mkdir -p "${INSTALL_DIR}/bin"
+
+# Detect or create normalized binary
+candidate=""
+if [ -f "${INSTALL_DIR}/manpager" ]; then
+  candidate="${INSTALL_DIR}/manpager"
+elif [ -f "${INSTALL_DIR}/bin/manpager" ]; then
+  candidate="${INSTALL_DIR}/bin/manpager"
+else
+  candidate="$(find "${INSTALL_DIR}" -maxdepth 2 -type f -name 'manpager' | head -n1 || true)"
+fi
+
+if [ -z "${candidate}" ] && [ -f "${INSTALL_DIR}/manpager.sh" ]; then
+  candidate="${INSTALL_DIR}/manpager.sh"
+fi
+
+if [ -n "${candidate}" ]; then
+  chmod +x "${candidate}" || true
+  if [ "${candidate}" != "${INSTALL_DIR}/bin/manpager" ]; then
+    cp -f "${candidate}" "${INSTALL_DIR}/bin/manpager"
+  fi
+else
+  # create shim
+  cat > "${INSTALL_DIR}/bin/manpager" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root_dir="$(cd "${self_dir}/.." && pwd)"
+# Prefer root-level executable
+if [ -x "${root_dir}/manpager" ]; then
+  exec "${root_dir}/manpager" "$@"
+elif [ -x "${root_dir}/bin/manpager" ] && [ "${root_dir}/bin/manpager" != "${self_dir}/manpager" ]; then
+  exec "${root_dir}/bin/manpager" "$@"
+else
+  echo "manpager executable not found in installation directory." >&2
+  exit 1
+fi
+EOF
+  chmod +x "${INSTALL_DIR}/bin/manpager"
+fi
+
+echo "${VERSION}" > "${INSTALL_DIR}/VERSION"
+
+info "Installed manpager ${VERSION} to ${INSTALL_DIR}"
+info "Run: asdf reshim manpager  # or let mise reshim automatically"
