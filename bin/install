@@ -167,6 +167,19 @@ install_manpager() {
 
   detect_and_install_executable "${install_path}"
 
+  # Ensure list-all and install are executable if present (avoid needing manual chmod)
+  for script_name in list-all install; do
+    # check top-level and bin/
+    if [ -f "${install_path}/${script_name}" ]; then
+      chmod +x "${install_path}/${script_name}" || true
+    fi
+    if [ -f "${install_path}/bin/${script_name}" ]; then
+      chmod +x "${install_path}/bin/${script_name}" || true
+    fi
+    # also search up to depth 2 for any matching files and chmod them
+    find "${install_path}" -maxdepth 2 -type f -name "${script_name}" -exec chmod +x {} \; || true
+  done
+
   echo "${version}" > "${install_path}/VERSION"
 
   info "Installed manpager ${version} to ${install_path}"
