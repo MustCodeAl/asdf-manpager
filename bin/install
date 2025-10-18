@@ -1,63 +1,158 @@
 #!/usr/bin/env bash
-# asdf plugin install helper
-# Called as: bin/install <version> <install_path>
+# asdf/mise plugin install helper
+# Usage:
+#   bin/install <version> <install_path>
+#   or bin/install "" <install_path>    # uses default version
+#
+# Behavior:
+#  - Accepts version from positional arg or common env vars.
+#  - Defaults to DEFAULT_VERSION if none supplied.
+#  - Validates upstream tag exists (via tag archive URL).
+#  - Downloads tag tarball, extracts, normalizes binary into <install_path>/bin/manpager
+#  - Records installed version in <install_path>/VERSION
+#
 set -euo pipefail
 
-VERSION="${1:?version is required}"
-INSTALL_DIR="${2:?install dir is required}"
+# ---- Configuration ----
+DEFAULT_VERSION="0.0.3"
+GH_REPO="Freed-Wu/manpager"
+GITHUB_ARCHIVE_TEMPLATE="https://github.com/${GH_REPO}/archive/refs/tags/%s.tar.gz"
 
+# ---- helpers (kept small and testable) ----
 # shellcheck source=../lib/utils.bash
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/utils.bash"
 
-GH_REPO="Freed-Wu/manpager"
-ARCHIVE_URL="https://github.com/${GH_REPO}/archive/refs/tags/${VERSION}.tar.gz"
-
-ensure_cmd curl
-ensure_cmd tar
-ensure_cmd mkdir
-ensure_cmd cp
-
-tmpdir="$(mktemp -d)"
-trap 'rm -rf "${tmpdir}"' EXIT
-
-info "Downloading ${GH_REPO}@${VERSION}"
-curl -fsSL "${ARCHIVE_URL}" -o "${tmpdir}/src.tar.gz"
-
-info "Extracting archive"
-mkdir -p "${tmpdir}/src"
-tar -xzf "${tmpdir}/src.tar.gz" -C "${tmpdir}/src"
-
-src_root="$(find "${tmpdir}/src" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
-[ -d "${src_root}" ] || fail "Failed to locate source root directory."
-
-# Prepare install dir
-mkdir -p "${INSTALL_DIR}"
-cp -R "${src_root}/." "${INSTALL_DIR}/"
-
-mkdir -p "${INSTALL_DIR}/bin"
-
-# Detect or create normalized binary
-candidate=""
-if [ -f "${INSTALL_DIR}/manpager" ]; then
-  candidate="${INSTALL_DIR}/manpager"
-elif [ -f "${INSTALL_DIR}/bin/manpager" ]; then
-  candidate="${INSTALL_DIR}/bin/manpager"
-else
-  candidate="$(find "${INSTALL_DIR}" -maxdepth 2 -type f -name 'manpager' | head -n1 || true)"
-fi
-
-if [ -z "${candidate}" ] && [ -f "${INSTALL_DIR}/manpager.sh" ]; then
-  candidate="${INSTALL_DIR}/manpager.sh"
-fi
-
-if [ -n "${candidate}" ]; then
-  chmod +x "${candidate}" || true
-  if [ "${candidate}" != "${INSTALL_DIR}/bin/manpager" ]; then
-    cp -f "${candidate}" "${INSTALL_DIR}/bin/manpager"
+get_version_from_args_or_env() {
+  local arg="${1:-}"
+  local v=""
+  # Prefer explicit arg if non-empty and not just placeholder
+  if [ -n "${arg}" ]; then
+    v="${arg}"
   fi
-else
-  # create shim
-  cat > "${INSTALL_DIR}/bin/manpager" <<'EOF'
+
+  # Common fallback environment variables (case-insensitive attempts)
+  if [ -z "${v}" ]; then
+    v="${MISE_VERSION:-${Mise_VERSION:-${MISE_ARG_VERSION:-${ASDF_INSTALL_VERSION:-${ASDF_VERSION:-}}}}}"
+  fi
+
+  # Some wrappers may pass name@version in an env var called MISE_ARG or in arg
+  if [ -z "${v}" ] && [ -n "${MISE_ARG:-}" ]; then
+    case "${MISE_ARG}" in
+      *@*) v="${MISE_ARG#*@}" ;;
+    esac
+  fi
+
+  if [ -z "${v}" ] && [ -n "${arg}" ]; then
+    case "${arg}" in
+      *@*) v="${arg#*@}" ;;
+    esac
+  fi
+
+  # Final fallback: default
+  if [ -z "${v}" ]; then
+    v="${DEFAULT_VERSION}"
+    info "no version supplied; defaulting to ${v}"
+  fi
+
+  echo "${v}"
+}
+
+validate_upstream_tag() {
+  local version="$1"
+  local url
+  url="$(printf "${GITHUB_ARCHIVE_TEMPLATE}" "${version}")"
+  info "Checking upstream tag archive URL: ${url}"
+  # check if reachable (don't output content)
+  if command -v curl >/dev/null 2>&1; then
+    if ! curl -fSL --head "${url}" >/dev/null 2>&1; then
+      return 1
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    if ! wget --spider -S "${url}" >/dev/null 2>&1; then
+      return 1
+    fi
+  else
+    fail "Neither curl nor wget is available to check upstream."
+  fi
+  return 0
+}
+
+download_archive() {
+  local version="$1"
+  local dest="$2"
+  local url
+  url="$(printf "${GITHUB_ARCHIVE_TEMPLATE}" "${version}")"
+  info "Downloading ${url} -> ${dest}"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "${url}" -o "${dest}" || return 1
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "${dest}" "${url}" || return 1
+  else
+    fail "Neither curl nor wget found to download archive"
+  fi
+}
+
+extract_archive_to_tmp() {
+  local archive="$1"
+  local destdir="$2"
+  info "Extracting ${archive} to ${destdir}"
+  mkdir -p "${destdir}"
+  tar -xzf "${archive}" -C "${destdir}" || return 1
+}
+
+find_extracted_root() {
+  local srcdir="$1"
+  # GitHub archives extract to a single top-level directory
+  local root
+  root="$(find "${srcdir}" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
+  echo "${root}"
+}
+
+normalize_install_tree() {
+  local src_root="$1"
+  local install_dir="$2"
+
+  info "Copying source files to ${install_dir}"
+  mkdir -p "${install_dir}"
+  cp -R "${src_root}/." "${install_dir}/"
+
+  mkdir -p "${install_dir}/bin"
+
+  # Look for an executable named 'manpager' in common places
+  local candidate=""
+  if [ -f "${install_dir}/manpager" ]; then
+    candidate="${install_dir}/manpager"
+  elif [ -f "${install_dir}/bin/manpager" ]; then
+    candidate="${install_dir}/bin/manpager"
+  else
+    candidate="$(find "${install_dir}" -maxdepth 3 -type f -name 'manpager' -perm /u+x 2>/dev/null | head -n1 || true)"
+  fi
+
+  # fallback to non-executable files named manpager
+  if [ -z "${candidate}" ]; then
+    candidate="$(find "${install_dir}" -maxdepth 3 -type f -name 'manpager' 2>/dev/null | head -n1 || true)"
+  fi
+
+  # try manpager.sh
+  if [ -z "${candidate}" ] && [ -f "${install_dir}/manpager.sh" ]; then
+    candidate="${install_dir}/manpager.sh"
+  fi
+
+  if [ -n "${candidate}" ]; then
+    info "Using candidate executable: ${candidate}"
+    chmod +x "${candidate}" || true
+    if [ "${candidate}" != "${install_dir}/bin/manpager" ]; then
+      cp -f "${candidate}" "${install_dir}/bin/manpager"
+    fi
+  else
+    info "No manpager file found in source; creating shim in ${install_dir}/bin/manpager"
+    create_shim "${install_dir}"
+  fi
+}
+
+create_shim() {
+  local install_dir="$1"
+  cat > "${install_dir}/bin/manpager" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -72,10 +167,64 @@ else
   exit 1
 fi
 EOF
-  chmod +x "${INSTALL_DIR}/bin/manpager"
-fi
+  chmod +x "${install_dir}/bin/manpager"
+}
 
-echo "${VERSION}" > "${INSTALL_DIR}/VERSION"
+write_version_file() {
+  local version="$1"
+  local install_dir="$2"
+  echo "${version}" > "${install_dir}/VERSION"
+}
 
-info "Installed manpager ${VERSION} to ${INSTALL_DIR}"
-info "Run: asdf reshim manpager  # or let mise reshim automatically"
+# ---- entrypoint ----
+main() {
+  local raw_arg_version="${1:-}"
+  local install_dir="${2:-}"
+
+  if [ -z "${install_dir}" ]; then
+    echo "asdf-manpager: ERROR: install path is required. Usage: bin/install <version> <install_path>" >&2
+    exit 2
+  fi
+
+  local version
+  version="$(get_version_from_args_or_env "${raw_arg_version}")"
+
+  # Quick upstream validation to give a fast, actionable error if tag missing
+  if ! validate_upstream_tag "${version}"; then
+    info "Upstream tag ${version} not found. Listing available versions via list-all:"
+    # print available versions to stderr to help debugging
+    if command -v "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/list-all" >/dev/null 2>&1; then
+      "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/list-all" >&2 || true
+    fi
+    fail "Upstream tag ${version} not found or unreachable."
+  fi
+
+  ensure_cmd mkdir
+  ensure_cmd cp
+  ensure_cmd tar
+  ensure_cmd find
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "${tmpdir}"' EXIT
+
+  local archive="${tmpdir}/src.tar.gz"
+  if ! download_archive "${version}" "${archive}"; then
+    fail "Failed to download archive for ${version}"
+  fi
+
+  local extracted_dir="${tmpdir}/src"
+  extract_archive_to_tmp "${archive}" "${extracted_dir}"
+
+  local src_root
+  src_root="$(find_extracted_root "${extracted_dir}")"
+  [ -d "${src_root}" ] || fail "Failed to locate extracted source root."
+
+  normalize_install_tree "${src_root}" "${install_dir}"
+  write_version_file "${version}" "${install_dir}"
+
+  info "Installed manpager ${version} to ${install_dir}"
+  info "Hint: run 'asdf reshim manpager' if using asdf; mise typically handles shims automatically."
+}
+
+main "$@"
