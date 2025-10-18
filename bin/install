@@ -2,40 +2,34 @@
 # asdf/mise plugin install helper
 # Usage:
 #   bin/install <version> <install_path>
-#   or bin/install "" <install_path>    # uses default version
-#
-# Behavior:
-#  - Accepts version from positional arg or common env vars.
-#  - Defaults to DEFAULT_VERSION if none supplied.
-#  - Validates upstream tag exists (via tag archive URL).
-#  - Downloads tag tarball, extracts, normalizes binary into <install_path>/bin/manpager
-#  - Records installed version in <install_path>/VERSION
-#
+#   bin/install "" <install_path>   # use default version
+# If install_path is not supplied, this script will try common env vars
+# and finally fall back to ~/.asdf/installs/manpager/<version>
 set -euo pipefail
 
 # ---- Configuration ----
 DEFAULT_VERSION="0.0.3"
+PLUGIN_NAME="manpager"
 GH_REPO="Freed-Wu/manpager"
 GITHUB_ARCHIVE_TEMPLATE="https://github.com/${GH_REPO}/archive/refs/tags/%s.tar.gz"
 
-# ---- helpers (kept small and testable) ----
+# ---- helpers ----
 # shellcheck source=../lib/utils.bash
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/utils.bash"
 
 get_version_from_args_or_env() {
   local arg="${1:-}"
   local v=""
-  # Prefer explicit arg if non-empty and not just placeholder
+
   if [ -n "${arg}" ]; then
     v="${arg}"
   fi
 
-  # Common fallback environment variables (case-insensitive attempts)
+  # Common fallback environment variables
   if [ -z "${v}" ]; then
     v="${MISE_VERSION:-${Mise_VERSION:-${MISE_ARG_VERSION:-${ASDF_INSTALL_VERSION:-${ASDF_VERSION:-}}}}}"
   fi
 
-  # Some wrappers may pass name@version in an env var called MISE_ARG or in arg
   if [ -z "${v}" ] && [ -n "${MISE_ARG:-}" ]; then
     case "${MISE_ARG}" in
       *@*) v="${MISE_ARG#*@}" ;;
@@ -48,27 +42,63 @@ get_version_from_args_or_env() {
     esac
   fi
 
-  # Final fallback: default
   if [ -z "${v}" ]; then
     v="${DEFAULT_VERSION}"
     info "no version supplied; defaulting to ${v}"
   fi
 
-  echo "${v}"
+  printf '%s' "${v}"
+}
+
+determine_install_dir() {
+  local provided="${1:-}"
+  local version="${2:-}"
+  local dir=""
+
+  # 1) explicit positional provided by caller
+  if [ -n "${provided}" ]; then
+    dir="${provided}"
+  fi
+
+  # 2) common environment variables used by asdf/mise
+  if [ -z "${dir}" ]; then
+    dir="${ASDF_INSTALL_DIR:-${ASDF_INSTALL_PATH:-${MISE_INSTALL_DIR:-${MISE_PREFIX:-}}}}"
+  fi
+
+  # 3) ASDF_DIR or ASDF_DATA_DIR layout if available
+  if [ -z "${dir}" ]; then
+    if [ -n "${ASDF_DATA_DIR:-}" ]; then
+      dir="${ASDF_DATA_DIR}/installs/${PLUGIN_NAME}/${version}"
+    elif [ -n "${ASDF_DIR:-}" ]; then
+      dir="${ASDF_DIR}/installs/${PLUGIN_NAME}/${version}"
+    fi
+  fi
+
+  # 4) MISE common fallback layout
+  if [ -z "${dir}" ] && [ -n "${HOME:-}" ]; then
+    # prefer mise location if MISE_HOME is present
+    if [ -n "${MISE_HOME:-}" ]; then
+      dir="${MISE_HOME}/installs/${PLUGIN_NAME}/${version}"
+    else
+      # final fallback to asdf-like path in home
+      dir="${HOME}/.asdf/installs/${PLUGIN_NAME}/${version}"
+    fi
+  fi
+
+  printf '%s' "${dir}"
 }
 
 validate_upstream_tag() {
   local version="$1"
   local url
   url="$(printf "${GITHUB_ARCHIVE_TEMPLATE}" "${version}")"
-  info "Checking upstream tag archive URL: ${url}"
-  # check if reachable (don't output content)
+  info "Checking upstream archive: ${url}"
   if command -v curl >/dev/null 2>&1; then
     if ! curl -fSL --head "${url}" >/dev/null 2>&1; then
       return 1
     fi
   elif command -v wget >/dev/null 2>&1; then
-    if ! wget --spider -S "${url}" >/dev/null 2>&1; then
+    if ! wget --spider -q "${url}" >/dev/null 2>&1; then
       return 1
     fi
   else
@@ -95,17 +125,15 @@ download_archive() {
 extract_archive_to_tmp() {
   local archive="$1"
   local destdir="$2"
-  info "Extracting ${archive} to ${destdir}"
   mkdir -p "${destdir}"
   tar -xzf "${archive}" -C "${destdir}" || return 1
 }
 
 find_extracted_root() {
   local srcdir="$1"
-  # GitHub archives extract to a single top-level directory
   local root
   root="$(find "${srcdir}" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
-  echo "${root}"
+  printf '%s' "${root}"
 }
 
 normalize_install_tree() {
@@ -118,7 +146,6 @@ normalize_install_tree() {
 
   mkdir -p "${install_dir}/bin"
 
-  # Look for an executable named 'manpager' in common places
   local candidate=""
   if [ -f "${install_dir}/manpager" ]; then
     candidate="${install_dir}/manpager"
@@ -128,12 +155,10 @@ normalize_install_tree() {
     candidate="$(find "${install_dir}" -maxdepth 3 -type f -name 'manpager' -perm /u+x 2>/dev/null | head -n1 || true)"
   fi
 
-  # fallback to non-executable files named manpager
   if [ -z "${candidate}" ]; then
     candidate="$(find "${install_dir}" -maxdepth 3 -type f -name 'manpager' 2>/dev/null | head -n1 || true)"
   fi
 
-  # try manpager.sh
   if [ -z "${candidate}" ] && [ -f "${install_dir}/manpager.sh" ]; then
     candidate="${install_dir}/manpager.sh"
   fi
@@ -145,7 +170,7 @@ normalize_install_tree() {
       cp -f "${candidate}" "${install_dir}/bin/manpager"
     fi
   else
-    info "No manpager file found in source; creating shim in ${install_dir}/bin/manpager"
+    info "No manpager file found; creating shim"
     create_shim "${install_dir}"
   fi
 }
@@ -157,7 +182,6 @@ create_shim() {
 set -euo pipefail
 self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root_dir="$(cd "${self_dir}/.." && pwd)"
-# Prefer root-level executable
 if [ -x "${root_dir}/manpager" ]; then
   exec "${root_dir}/manpager" "$@"
 elif [ -x "${root_dir}/bin/manpager" ] && [ "${root_dir}/bin/manpager" != "${self_dir}/manpager" ]; then
@@ -179,23 +203,23 @@ write_version_file() {
 # ---- entrypoint ----
 main() {
   local raw_arg_version="${1:-}"
-  local install_dir="${2:-}"
-
-  if [ -z "${install_dir}" ]; then
-    echo "asdf-manpager: ERROR: install path is required. Usage: bin/install <version> <install_path>" >&2
-    exit 2
-  fi
+  local raw_arg_install="${2:-}"
 
   local version
   version="$(get_version_from_args_or_env "${raw_arg_version}")"
 
-  # Quick upstream validation to give a fast, actionable error if tag missing
+  local install_dir
+  install_dir="$(determine_install_dir "${raw_arg_install}" "${version}")"
+
+  if [ -z "${install_dir}" ]; then
+    fail "install path is required and could not be determined from arguments or environment"
+  fi
+
+  info "Installing ${PLUGIN_NAME} version ${version} to ${install_dir}"
+
   if ! validate_upstream_tag "${version}"; then
-    info "Upstream tag ${version} not found. Listing available versions via list-all:"
-    # print available versions to stderr to help debugging
-    if command -v "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/list-all" >/dev/null 2>&1; then
-      "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/list-all" >&2 || true
-    fi
+    info "Upstream tag ${version} not found. Available tags (via list-all):"
+    "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/list-all" >&2 || true
     fail "Upstream tag ${version} not found or unreachable."
   fi
 
@@ -223,8 +247,8 @@ main() {
   normalize_install_tree "${src_root}" "${install_dir}"
   write_version_file "${version}" "${install_dir}"
 
-  info "Installed manpager ${version} to ${install_dir}"
-  info "Hint: run 'asdf reshim manpager' if using asdf; mise typically handles shims automatically."
+  info "Installed ${PLUGIN_NAME} ${version} to ${install_dir}"
+  info "Hint: run 'asdf reshim ${PLUGIN_NAME}' if using asdf; mise typically handles shims automatically."
 }
 
 main "$@"
