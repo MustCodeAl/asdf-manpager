@@ -1,9 +1,12 @@
-# Optional metadata used by mise (and helpful documentation)
+# Optional metadata used by mise (and helpful documentation).
 [plugin]
 name = "manpager"
 type = "cli"
 description = "Colorize man pages (manpager)"
 homepage = "https://github.com/Freed-Wu/manpager"
+
+# Suggested default version for wrappers that consult plugin metadata.
+default_version = "0.0.3"
 
 [commands]
 manpager = "manpager"
